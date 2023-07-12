@@ -1,0 +1,178 @@
+---
+title: "RNAseq Quality Control and Filtering Workflow"
+output: html_notebook
+---
+
+For the chemokine project, the following QC workflow will be used for filtering and analysis of all scRNAseq data. In this .rmd file, I am using the Gao, et al. dataset as an example, but feel free to simply substitute in another dataset. Depending on if the data for different samples is stored in the same matrix or different ones, that may effect the first few steps of batch correction here.
+
+## General Quality Control
+
+[**For QC, generally we will do the following:**]{.underline}
+
+-   Remove cells with high percentage of mitochondrial DNA (indicates dead or dying cells).
+
+-   Remove cells with very low gene/feature counts or low UMI, as they were possibly poorly sequenced.
+
+-   Remove cells with a low log10 genes per UMI (low complexity).
+
+[**What cells are excluded for the purposes of this project?**]{.underline}
+
+-   Feature count under 200.
+
+-   UMI under 500.
+
+-   Log 10 Genes per UMI under 0.8.
+
+-   Mitochondrial DNA over 5%.
+
+Question - Do i do batch correction before or after other QC?
+
+## Cell Counts
+
+If you are analysing data from cells you prepared or sent in for sequencing, or had prior knowledge on the number of cells sequenced, you can compare the \# of cells you sent in to the number of cell barcodes to assess the capture rate.
+
+## Load Dataset
+
+To analyse this dataset, download the [Gao, et al. dataset from the Curated Cancer Atlas](https://www.weizmann.ac.il/sites/3CA/breast).
+
+```{r}
+# Load Matrix package and Seurat:
+library(Matrix)
+library(Seurat)
+
+# Load UMI count matrix:
+mtx1 <- readMM("/Exp_data_UMIcounts.mtx")
+sparse_mtx1 <- Matrix(mtx1)
+# df1 <- as.data.frame(as(sparse_mtx1, "matrix"))
+
+# Import annotation/metadata:
+annotation1 <- read.csv("/Users/dagnyreese/Desktop/thesis/Breast_Part1/Breast_Data/Data_Gao2021_Breast/Breast/Cells.csv")
+
+# Import gene names and remove quotations:
+genenames1 <- readLines("/Users/dagnyreese/Desktop/thesis/Breast_Part1/Breast_Data/Data_Gao2021_Breast/Breast/Genes.txt")
+genenames1 <- gsub("\"", "", genenames1)
+df1 <- data.frame(genenames1)
+
+# Make sure the features and cell names are included:
+# When formatting datasets for Seurat, make sure that the row names for the metadata correspond to the column names on the count data - you can use numbers, cell identifiers, etc. - all that matters is they match up:
+colnames(mtx1) <- annotation1[,1]
+rownames(annotation1) <- annotation1[,1]
+rownames(mtx1) <- genenames1
+
+# Create Seurat object:
+breast1 <- CreateSeuratObject(
+  mtx1,
+  project = "GaoBreast1",
+  meta.data = annotation1
+)
+```
+
+## Calculate Log10 Genes per UMI and Percent Mitochondrial Transcripts
+
+```{r}
+# [[]] lets you add columns to seurat object metadata! Very useful to add these QC metrics into the object metadata.
+
+# With a regex pattern, if you put a ^ before the text e.g. "^MT-", that indicates that you are looking for the text at the very beginning of the string. Check your formatting of your column names for this!
+# Calculate percent mitochondrial DNA
+breast1[["percent.mito"]] <- PercentageFeatureSet(breast1, pattern = "MT-")
+
+# nFeature_RNA and nCount_RNA respectively indicate the number of genes and number of UMI for each cell.
+
+# Calculate log10 genes per UMI:
+breast1[["log10GenesPerUMI"]] <- log10(breast1$nFeature_RNA) / log10(breast1$nCount_RNA)
+```
+
+## Summary Figures of QC Metrics
+
+```{r}
+
+#breast1 <- subset(breast1, subset = nCount_RNA > 500, nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito < 5)
+
+features_QC <- breast1@meta.data %>%
+ggplot(aes(x=nFeature_RNA, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 200) + # this allows you to edit the vertical line.
+    ggtitle("# Features") # this is the title of the subplot.
+
+UMI_QC <- breast1@meta.data %>%
+ggplot(aes(x=nCount_RNA, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+    ggtitle("UMI")
+
+mito_QC <- breast1@meta.data %>%
+ggplot(aes(x=percent.mito, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 5) +
+    ggtitle("Percent Mitocondrial DNA")
+
+genepUMI_QC <- breast1@meta.data %>%
+ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8) +
+    ggtitle("Log10 Genes per UMI")
+
+
+# Patchwork library needed to "stitch" ggplots together into a nicer format
+library(patchwork)
+
+# All the plots above put into a nice 4x4 grid
+qc_plot <- features_QC + UMI_QC + mito_QC + genepUMI_QC +
+  plot_layout(ncol = 2) + # this allows you to edit the number of columns
+  plot_annotation(title = 'QC Distribution Plots by Sample') # title of combined plot
+qc_plot
+
+# If you want to save this plot, uncomment the line below and it will save the plot as a .jpeg in your working directory
+
+# ggsave("qc_plot.jpg", qc_plot, device = "jpeg")
+```
+
+## Filter Out Low Quality and Dying Cells
+
+```{r}
+# Generate subset that only follows QC criteria and then normalise.
+# Alter the cutoffs below if you'd like to use different ones:
+breast1 <- subset(breast1,
+                  subset = nCount_RNA > 500 &
+                  nFeature_RNA > 200 &
+                  log10GenesPerUMI > 0.8 &
+                  percent.mito < 5)
+
+#breast1 <- NormalizeData(breast1, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+## Removal of Low Expressed Genes (Present in \< 10 cells)
+
+```{r}
+# Define which genes have non-zero counts and which are above the defined cutoff (e.g. 10 cells)
+gene_counts <- GetAssayData(object = breast1, slot = "counts")
+nonzero_counts <- counts > 0
+genes_above_cutoff <- Matrix::rowSums(nonzero) >= 10 # this is the cutoff for number of cells
+
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- gene_counts[genes_above_cutoff, ]
+
+# Create new Seurat object only with genes above cutoff
+breast1 <- CreateSeuratObject(filtered_counts, meta.data = breast1@meta.data)
+
+# Uncomment below to save data in working directory:
+#save(breast1, file="data/breast1.RData")
+```
+
+## Harmony and Doublet Removal
+
+Use of Harmony and doublet removal will be done later after scaling data and running principle component analysis.
+
+## References
+
+<https://satijalab.org/seurat/articles/pbmc3k_tutorial.html>
+
+<http://htmlpreview.github.io/?https://github.com/immunogenomics/harmony/blob/master/docs/SeuratV3.html>
+
+<https://www.10xgenomics.com/resources/analysis-guides/common-considerations-for-quality-control-filters-for-single-cell-rna-seq-data>
+
+<https://hbctraining.github.io/scRNA-seq/lessons/04_SC_quality_control.html>
